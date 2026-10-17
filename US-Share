@@ -1,0 +1,339 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+import logging
+from datetime import datetime
+from scipy.optimize import minimize
+from sklearn.preprocessing import StandardScaler
+from hmmlearn.hmm import GaussianHMM
+
+# 屏蔽底层警告
+logging.getLogger("hmmlearn").setLevel(logging.ERROR)
+
+plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
+
+# ==================== 1. 数据配置 ====================
+# 选择涵盖美股核心风格、商品与避险资产的 ETF
+TICKERS = {
+    "SPY": "US Large Cap",      # 标普500
+    "QQQ": "US Tech",           # 纳斯达克100
+    "IWM": "US Small Cap",      # 罗素2000
+    "EEM": "Emerging Mkts",     # 新兴市场
+    "XLF": "Financials",        # 金融板块
+    "XLE": "Energy",            # 能源板块
+    "TLT": "Long Treasuries",   # 20年期国债（避险）
+    "GLD": "Gold"               # 黄金（避险）
+}
+START_DATE = "2007-01-01"
+END_DATE = "2024-01-01"
+
+# ==================== 2. 基础工具函数 ====================
+def load_us_data():
+    print("[Data] 正在从 Yahoo Finance 下载美股数据...")
+    raw = yf.download(list(TICKERS.keys()), start=START_DATE, end=END_DATE, progress=False)
+    price = raw["Adj Close"] if "Adj Close" in raw.columns else raw["Close"]
+    price = price.ffill().dropna()
+    # 转周线
+    weekly = price.resample("W").last()
+    returns = weekly.pct_change(fill_method=None).dropna()
+    return weekly, returns
+
+def robust_covariance(returns_df, reg=1e-6):
+    from sklearn.covariance import LedoitWolf
+    lw = LedoitWolf().fit(returns_df.values)
+    cov = lw.covariance_
+    cov += reg * np.eye(cov.shape[0])
+    return pd.DataFrame(cov, index=returns_df.columns, columns=returns_df.columns)
+
+def risk_parity_weights(cov_matrix, max_weight=0.20):
+    vols = np.sqrt(np.diag(cov_matrix.values))
+    inv_vol = 1.0 / (vols + 1e-8)
+    w = inv_vol / inv_vol.sum()
+    for _ in range(50):
+        if (w <= max_weight).all(): break
+        excess = np.maximum(w - max_weight, 0).sum()
+        w = np.minimum(w, max_weight)
+        room = (w < max_weight)
+        if room.sum() == 0: break
+        w[room] += excess * (w[room] / w[room].sum())
+    return pd.Series(w / w.sum(), index=cov_matrix.index)
+
+# ==================== 3. 核心组件 (GARCH & HMM) ====================
+def fit_garch_predict(returns_series):
+    r = returns_series.values * 100
+    if len(r) < 20 or np.std(r) < 1e-6:
+        return np.std(r) / 100
+    
+    def neg_loglik(params):
+        omega, alpha, beta = params
+        if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 1: return 1e10
+        h = np.zeros(len(r)); h[0] = np.var(r)
+        for t in range(1, len(r)):
+            h[t] = omega + alpha * r[t-1]**2 + beta * h[t-1]
+        h = np.clip(h, 1e-8, None)
+        return 0.5 * np.sum(np.log(2 * np.pi * h) + r**2 / h)
+    
+    try:
+        res = minimize(neg_loglik, [np.var(r)*0.2, 0.1, 0.7], 
+                       bounds=((1e-8, None), (1e-4, 0.5), (1e-4, 0.95)), 
+                       method="L-BFGS-B", options={"maxiter": 50})
+        omega, alpha, beta = res.x if res.success else [np.var(r)*0.2, 0.1, 0.7]
+    except:
+        omega, alpha, beta = [np.var(r)*0.2, 0.1, 0.7]
+    
+    h = np.zeros(len(r)); h[0] = np.var(r)
+    for t in range(1, len(r)):
+        h[t] = omega + alpha * r[t-1]**2 + beta * h[t-1]
+    return np.sqrt(omega + alpha * r[-1]**2 + beta * h[-1]) / 100
+
+class US_HMM:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.crisis_state = None
+        
+    def fit(self, ret_df, vol_df):
+        features = np.hstack([ret_df.values, vol_df.values * np.sqrt(52)])
+        features = np.nan_to_num(features, nan=0.0)
+        self.scaler.fit(features)
+        scaled = self.scaler.transform(features)
+        
+        best_bic, best_model, best_n = np.inf, None, 2
+        for n in [2, 3]:
+            try:
+                m = GaussianHMM(n_components=n, covariance_type="diag", 
+                                n_iter=200, random_state=42)
+                m.fit(scaled)
+                bic = m.bic(scaled)
+                if bic < best_bic:
+                    best_bic, best_model, best_n = bic, m, n
+            except: continue
+            
+        self.model = best_model if best_model else GaussianHMM(n_components=2).fit(scaled)
+        n_assets = ret_df.shape[1]
+        means = self.model.means_
+        score = means[:, :n_assets].mean(axis=1) - means[:, n_assets:].mean(axis=1)
+        self.crisis_state = int(np.argmin(score))
+        
+    def predict_prob(self, ret_df, vol_df):
+        features = np.hstack([ret_df.values, vol_df.values * np.sqrt(52)])
+        features = np.nan_to_num(features, nan=0.0)
+        scaled = self.scaler.transform(features)
+        proba = self.model.predict_proba(scaled)[:, self.crisis_state]
+        return pd.Series(proba).rolling(window=4, min_periods=1).mean().values
+
+# ==================== 4. 回测引擎 ====================
+def run_backtest(weekly_price, returns, mode="Optimized"):
+    """mode: 'Original', 'Optimized', 'NoHMM'"""
+    n_total = len(returns)
+    train_window, test_window, step_size = 156, 4, 4 # 3年训练窗口
+    
+    strat_returns, timeline = [], []
+    crisis_probs = []
+    current_weights = None
+    last_smoothed_p = 0.0
+    
+    # 核心参数
+    HMM_P_SAFE, HMM_P_RISK = 0.30, 0.70
+    min_exposure = 0.35 if mode == "Original" else 0.60
+    alpha_damper = 0.4 if mode == "Original" else 0.6
+    
+    growth_assets = list(TICKERS.keys())
+    
+    for w_idx in range((n_total - train_window - test_window) // step_size):
+        train_end = train_window + w_idx * step_size
+        test_start = train_end
+        test_end = min(test_start + test_window, n_total)
+        
+        train_data = returns.iloc[train_end - train_window : train_end]
+        test_data = returns.iloc[test_start : test_end]
+        if len(train_data) < 52: continue
+        
+        # 1. GARCH 波动率特征
+        train_vol = pd.DataFrame(index=train_data.index)
+        for c in growth_assets:
+            vols = [fit_garch_predict(train_data[c].iloc[:i]) for i in range(20, len(train_data))]
+            train_vol[c] = [np.nan]*20 + vols
+        train_vol = train_vol.ffill().bfill()
+        
+        test_vol_weekly = pd.DataFrame(index=test_data.index, columns=growth_assets, dtype=float)
+        for c in growth_assets:
+            for date in test_data.index:
+                test_vol_weekly.loc[date, c] = fit_garch_predict(returns[c].loc[:date])
+                
+        # 2. HMM 预测
+        if mode != "NoHMM":
+            hmm = US_HMM()
+            try: hmm.fit(train_data, train_vol)
+            except: hmm = None
+            raw_proba = hmm.predict_prob(test_data, test_vol_weekly) if hmm else np.zeros(len(test_data))
+        else:
+            raw_proba = np.zeros(len(test_data))
+            
+        # 3. 基础权重 (Risk Parity)
+        cov_matrix = robust_covariance(train_data)
+        w_base = risk_parity_weights(cov_matrix)
+        
+        # 4. 逐周执行
+        for i, date in enumerate(test_data.index):
+            p_smooth = alpha_damper * raw_proba[i] + (1 - alpha_damper) * last_smoothed_p
+            last_smoothed_p = p_smooth
+            
+            # 趋势过滤 (40周均线)
+            w_trend = w_base.copy()
+            hist = weekly_price.loc[:date]
+            if len(hist) >= 40:
+                ma = hist.tail(40).mean()
+                last_price = hist.iloc[-1]
+                broken_assets = [c for c in w_base.index if c in ma.index and last_price[c] < ma[c]]
+                for c in broken_assets:
+                    w_trend[c] *= 0.4
+                if w_trend.sum() > 0: w_trend /= w_trend.sum()
+            
+            # 计算仓位
+            if mode == "NoHMM":
+                exposure = 1.0
+            else:
+                if p_smooth <= HMM_P_SAFE: base_exp = 1.0
+                elif p_smooth >= HMM_P_RISK: base_exp = min_exposure
+                else:
+                    ratio = (p_smooth - HMM_P_SAFE) / (HMM_P_RISK - HMM_P_SAFE)
+                    base_exp = 1.0 - ratio * (1.0 - min_exposure)
+                
+                # 联合信号优化
+                if mode == "Optimized":
+                    trend_broken = (w_trend.sum() / w_base.sum()) < 0.8
+                    if not trend_broken:
+                        base_exp = 1.0 - (1.0 - base_exp) * 0.5
+                exposure = base_exp
+            
+            w_final = w_trend * exposure
+            w_final["Cash"] = 1.0 - exposure
+            
+            # 换手惩罚
+            if current_weights is not None:
+                turnover = np.sum(np.abs(w_final - current_weights.reindex(w_final.index, fill_value=0.0)))
+                if turnover > 0.5:
+                    scale = 0.5 / turnover
+                    w_final = current_weights + scale * (w_final - current_weights)
+                    w_final = w_final / w_final.sum()
+            
+            port_ret = float((w_final.reindex(growth_assets, fill_value=0.0) * test_data.loc[date]).sum())
+            if current_weights is not None:
+                port_ret -= 0.001 * np.sum(np.abs(w_final - current_weights.reindex(w_final.index, fill_value=0.0)))
+                
+            strat_returns.append(port_ret)
+            timeline.append(date)
+            crisis_probs.append(p_smooth)
+            current_weights = w_final
+
+    return pd.Series(strat_returns, index=pd.DatetimeIndex(timeline)), pd.Series(crisis_probs, index=pd.DatetimeIndex(timeline))
+
+# ==================== 5. 主流程 ====================
+def main():
+    print("="*70)
+    print("  美股长周期评测 (2007-2024) — 包含 08 金融危机与 20 熔断")
+    print("="*70)
+    
+    weekly_price, returns = load_us_data()
+    
+    print("\n[1] 运行 基准 (等权)...")
+    benchmark_ret = returns.mean(axis=1)
+    
+    print("[2] 运行 纯趋势 (No HMM)...")
+    ret_no_hmm, _ = run_backtest(weekly_price, returns, mode="NoHMM")
+    
+    print("[3] 运行 原始 HMM...")
+    ret_orig, prob_orig = run_backtest(weekly_price, returns, mode="Original")
+    
+    print("[4] 运行 优化版 HMM...")
+    ret_opt, prob_opt = run_backtest(weekly_price, returns, mode="Optimized")
+    
+    # 截取对齐的时间段
+    common_idx = ret_no_hmm.index.intersection(benchmark_ret.index)
+    ret_no_hmm = ret_no_hmm.loc[common_idx]
+    ret_orig = ret_orig.loc[common_idx]
+    ret_opt = ret_opt.loc[common_idx]
+    bench = benchmark_ret.loc[common_idx]
+    
+    # 绩效计算
+    def calc_metrics(ret):
+        cum = np.cumprod(1 + ret)
+        total = cum[-1] - 1
+        ann_ret = (1 + total) ** (52 / len(ret)) - 1
+        ann_vol = np.std(ret) * np.sqrt(52)
+        sharpe = ann_ret / ann_vol if ann_vol > 1e-8 else 0
+        dd = (cum - np.maximum.accumulate(cum)) / np.maximum.accumulate(cum)
+        max_dd = dd.min()
+        calmar = ann_ret / abs(max_dd) if abs(max_dd) > 1e-8 else 0
+        return {"TotalRet": total, "AnnRet": ann_ret, "AnnVol": ann_vol, 
+                "Sharpe": sharpe, "MaxDD": max_dd, "Calmar": calmar}
+    
+    metrics = {
+        "Benchmark (等权)": calc_metrics(bench),
+        "No HMM (纯趋势)": calc_metrics(ret_no_hmm),
+        "Original HMM": calc_metrics(ret_orig),
+        "Optimized HMM": calc_metrics(ret_opt)
+    }
+    
+    print("\n" + "="*90)
+    print(f"{'Configuration':<22}{'TotalRet':<12}{'AnnRet':<10}{'AnnVol':<10}{'Sharpe':<9}{'MaxDD':<11}{'Calmar':<9}")
+    print("-" * 90)
+    for name, m in metrics.items():
+        print(f"{name:<22}{m['TotalRet']:>8.2%}   {m['AnnRet']:>8.2%}  {m['AnnVol']:>8.2%}  "
+              f"{m['Sharpe']:>6.2f}   {m['MaxDD']:>8.2%}   {m['Calmar']:>6.2f}")
+    print("="*90)
+
+    # 画图
+    fig, axes = plt.subplots(3, 1, figsize=(16, 14), gridspec_kw={"height_ratios": [3, 1.5, 1]})
+    
+    # 1. 净值
+    ax = axes[0]
+    ax.plot(common_idx, (np.cumprod(1 + bench) - 1) * 100, label="Benchmark", color="grey", linestyle="--")
+    ax.plot(common_idx, (np.cumprod(1 + ret_no_hmm) - 1) * 100, label="No HMM (纯趋势)", color="#ff7f0e", alpha=0.7)
+    ax.plot(common_idx, (np.cumprod(1 + ret_orig) - 1) * 100, label="Original HMM", color="#d62728", alpha=0.6, linestyle="--")
+    ax.plot(common_idx, (np.cumprod(1 + ret_opt) - 1) * 100, label="Optimized HMM", color="#2ca02c", linewidth=2.5)
+    
+    # 标注 08 和 20 危机
+    for crisis, name in [("2008-09-01", "2008 次贷危机"), ("2020-02-20", "2020 疫情熔断")]:
+        ax.axvline(pd.to_datetime(crisis), color="red", linestyle=":", alpha=0.8)
+        ax.text(pd.to_datetime(crisis), ax.get_ylim()[1]*0.8, f" {name}", color="red", fontsize=10)
+        
+    ax.set_title("美股长周期回测 (2007-2024)：HMM 在极端危机中的表现", fontweight="bold")
+    ax.set_ylabel("Cumulative Return (%)")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+    
+    # 2. 回撤
+    ax = axes[1]
+    def get_dd(r):
+        c = np.cumprod(1 + r)
+        return (c - np.maximum.accumulate(c)) / np.maximum.accumulate(c) * 100
+    ax.plot(common_idx, get_dd(bench), color="grey", linestyle="--", alpha=0.5)
+    ax.plot(common_idx, get_dd(ret_no_hmm), color="#ff7f0e", alpha=0.5)
+    ax.plot(common_idx, get_dd(ret_orig), color="#d62728", alpha=0.5)
+    ax.plot(common_idx, get_dd(ret_opt), color="#2ca02c", linewidth=2)
+    ax.set_title("Drawdown Comparison", fontweight="bold")
+    ax.set_ylabel("Drawdown (%)")
+    ax.grid(True, alpha=0.3)
+    
+    # 3. HMM 危机概率
+    ax = axes[2]
+    ax.fill_between(common_idx, 0, prob_opt, color="crimson", alpha=0.6)
+    ax.axhline(0.5, color="black", linestyle="--", linewidth=1)
+    ax.set_title("Optimized HMM Crisis Probability", fontweight="bold")
+    ax.set_ylabel("Probability")
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig("us_market_dashboard.png", dpi=200, bbox_inches="tight")
+    print("\n📊 图表已保存: us_market_dashboard.png")
+
+if __name__ == "__main__":
+    main()
