@@ -1,0 +1,227 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+plt.rcParams["font.sans-serif"] = ["SimHei", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
+
+import numpy as np
+import pandas as pd
+from config import FEATURE_FLAGS, HMM_P_SAFE, HMM_P_RISK, GROWTH_ASSETS
+from data_utils import load_real_a_share_data, to_weekly_returns
+from backtest import compute_metrics
+from portfolio import AdvancedCrisisManager, apply_trend_filter, apply_defensive_floor, defensive_floor_weights, apply_turnover_limit, compute_turnover_cost, risk_parity_weights
+from risk_models import rolling_garch_vol_series, fit_garch_predict, AdaptiveHMM
+from data_utils import rmt_clean_correlation
+
+# =========================================================
+# 核心调整：继承并重写 AdvancedCrisisManager
+# =========================================================
+class OptimizedCrisisManager(AdvancedCrisisManager):
+    """优化版危机管理器：
+    1. 调高最低仓位 (从 0.35 提高到 0.60)，防止踏空。
+    2. 加快 EWMA 阻尼 (从 0.4 提高到 0.6)，危机解除后快速恢复仓位。
+    3. 引入联合信号：如果趋势没破位，HMM 减仓威力减半。
+    """
+    def __init__(self):
+        super().__init__(alpha=0.6, vol_target=0.12) # 调高 alpha
+        self.min_exposure = 0.60                    # 调高底仓
+        
+    def probability_to_exposure_optimized(self, p_crisis, trend_broken):
+        # 1. 计算基础 HMM 目标仓位
+        if p_crisis <= HMM_P_SAFE:
+            base_exposure = 1.0
+        elif p_crisis >= HMM_P_RISK:
+            base_exposure = self.min_exposure
+        else:
+            ratio = (p_crisis - HMM_P_SAFE) / (HMM_P_RISK - HMM_P_SAFE)
+            base_exposure = 1.0 - ratio * (1.0 - self.min_exposure)
+            
+        # 2. 联合判断逻辑
+        if not trend_broken:
+            # 如果趋势完好，HMM 的减仓警告打个 5 折（防止 V 型反转踏空）
+            final_exposure = 1.0 - (1.0 - base_exposure) * 0.5
+        else:
+            # 如果趋势已经破位，完全信任 HMM 的防御
+            final_exposure = base_exposure
+            
+        return final_exposure
+
+# =========================================================
+# 自定义回测引擎（复制了 backtest.py 的核心逻辑，但接入了联合信号）
+# =========================================================
+def run_optimized_backtest(weekly_returns, price_df, verbose=True):
+    all_assets = weekly_returns.columns.tolist()
+    n_total = len(weekly_returns)
+    train_window = 104
+    test_window = 4
+    step_size = 4
+    
+    strat_returns, timeline, crisis_probs, exposures = [], [], [], []
+    current_weights = None
+    crisis_mgr = OptimizedCrisisManager()
+    
+    n_windows = (n_total - train_window - test_window) // step_size
+    
+    for w_idx in range(n_windows):
+        train_end = train_window + w_idx * step_size
+        test_start = train_end
+        test_end = min(test_start + test_window, n_total)
+        if test_end <= test_start: break
+
+        train_data = weekly_returns.iloc[train_end - train_window : train_end]
+        test_data = weekly_returns.iloc[test_start : test_end]
+        
+        # 1. 训练 HMM 和 GARCH
+        train_vol = pd.DataFrame(index=train_data.index)
+        for c in all_assets:
+            train_vol[c] = rolling_garch_vol_series(train_data[c], refit_freq=8)
+            
+        hmm = AdaptiveHMM()
+        try:
+            hmm.fit(train_data[GROWTH_ASSETS], train_vol[GROWTH_ASSETS])
+        except:
+            hmm = None
+            
+        combined = pd.concat([train_data, test_data], axis=0)
+        test_vol_weekly = pd.DataFrame(index=test_data.index, columns=all_assets, dtype=float)
+        for c in all_assets:
+            for date in test_data.index:
+                hist = combined[c].loc[:date]
+                vol, _ = fit_garch_predict(hist)
+                test_vol_weekly.loc[date, c] = vol
+                
+        raw_proba = hmm.predict_crisis_probability(test_data[GROWTH_ASSETS], test_vol_weekly[GROWTH_ASSETS]) if hmm else np.zeros(len(test_data))
+        
+        # 2. RMT + 风险平价
+        cov_raw = train_data.corr()
+        cov_clean = rmt_clean_correlation(cov_raw, T=len(train_data), N=len(all_assets))
+        stds = train_data.std().values
+        cov_matrix = pd.DataFrame(cov_clean.values * np.outer(stds, stds), index=all_assets, columns=all_assets)
+        cov_matrix += np.eye(len(all_assets)) * 1e-6 * np.trace(cov_matrix.values) / len(all_assets)
+        w_base = risk_parity_weights(cov_matrix)
+        
+        # 3. 逐周执行
+        defensive_floor = defensive_floor_weights()
+        for i, date in enumerate(test_data.index):
+            p_smooth = crisis_mgr.smooth_crisis_probability(raw_proba[i])
+            
+            # 计算趋势是否破位
+            w_trend = apply_trend_filter(w_base, price_df, date)
+            trend_ratio = w_trend.sum() / w_base.sum()
+            trend_broken = trend_ratio < 0.8  # 权重下降超20%视为破位
+            
+            # 核心：使用联合信号计算仓位
+            exposure = crisis_mgr.probability_to_exposure_optimized(p_smooth, trend_broken)
+            
+            w_with_def = apply_defensive_floor(w_trend, defensive_floor)
+            w_with_def, vol_scale = crisis_mgr.apply_vol_targeting(w_with_def, cov_matrix)
+            
+            final_exposure = exposure * vol_scale
+            w_final = w_with_def * final_exposure
+            w_final["Cash"] = 1.0 - final_exposure
+            
+            w_final = apply_turnover_limit(current_weights, w_final)
+            
+            actual_ret = test_data.loc[date]
+            port_ret = float((w_final.reindex(all_assets, fill_value=0.0) * actual_ret).sum())
+            port_ret -= compute_turnover_cost(current_weights, w_final)
+            
+            strat_returns.append(port_ret)
+            timeline.append(date)
+            crisis_probs.append(p_smooth)
+            exposures.append(final_exposure)
+            current_weights = w_final
+
+    return {
+        "timeline": pd.DatetimeIndex(timeline),
+        "strat_returns": np.array(strat_returns),
+        "exposures": np.array(exposures),
+        "crisis_probs": np.array(crisis_probs)
+    }
+
+# =========================================================
+# 主对比实验
+# =========================================================
+def main():
+    print("="*70)
+    print("  HMM 优化测试：联合信号 + 调高底仓 vs 原始模型")
+    print("="*70)
+    
+    print("\n[1] 加载数据...")
+    try:
+        # 尝试下载真实数据
+        price_df = load_real_a_share_data(start_date="20180101")
+        print("-> 真实 A 股数据加载成功！")
+    except Exception as e:
+        print(f"\n⚠️ 真实数据加载失败: {e}")
+        print("-> 正在自动回退到【模拟数据】以保证流程跑通...\n")
+        from data_utils import _generate_mock_data
+        price_df = _generate_mock_data() # 使用之前写好的模拟数据
+
+    weekly_returns = to_weekly_returns(price_df)
+    
+    print("\n[2] 运行原始模型 (Original HMM)...")
+    from backtest import run_backtest
+    res_original = run_backtest(weekly_returns, price_df, flags=FEATURE_FLAGS, verbose=False)
+    m_original = compute_metrics(res_original["strat_returns"])
+    
+    print("[3] 运行无 HMM 模型 (No HMM)...")
+    flags_no_hmm = FEATURE_FLAGS.copy()
+    flags_no_hmm["USE_HMM"] = False
+    res_no_hmm = run_backtest(weekly_returns, price_df, flags=flags_no_hmm, verbose=False)
+    m_no_hmm = compute_metrics(res_no_hmm["strat_returns"])
+    
+    print("[4] 运行优化版模型 (Optimized HMM)...")
+    res_opt = run_optimized_backtest(weekly_returns, price_df)
+    m_opt = compute_metrics(res_opt["strat_returns"])
+    
+    # 打印对比表
+    print("\n" + "="*90)
+    print(f"{'Configuration':<24}{'TotalRet':<12}{'AnnRet':<10}{'AnnVol':<10}{'Sharpe':<9}{'MaxDD':<11}{'Calmar':<9}")
+    print("-" * 90)
+    for name, m in [("Original HMM", m_original), ("No HMM", m_no_hmm), ("Optimized HMM", m_opt)]:
+        print(f"{name:<24}{m['Total Return']:<12}{m['Annual Return']:<10}"
+              f"{m['Annual Vol']:<10}{m['Sharpe']:<9}{m['Max Drawdown']:<11}{m['Calmar']:<9}")
+    print("="*90)
+
+    # 画图
+    plt.figure(figsize=(16, 10))
+    
+    # 净值
+    plt.subplot(2, 1, 1)
+    cum_orig = np.cumprod(1 + res_original["strat_returns"]) - 1
+    cum_no_hmm = np.cumprod(1 + res_no_hmm["strat_returns"]) - 1
+    cum_opt = np.cumprod(1 + res_opt["strat_returns"]) - 1
+    
+    plt.plot(res_original["timeline"], cum_orig * 100, label="Original HMM", color="#d62728", alpha=0.6, linestyle="--")
+    plt.plot(res_no_hmm["timeline"], cum_no_hmm * 100, label="No HMM (纯趋势)", color="#ff7f0e", alpha=0.7)
+    plt.plot(res_opt["timeline"], cum_opt * 100, label="Optimized HMM (联合信号)", color="#2ca02c", linewidth=2.5)
+    
+    plt.title("HMM 优化前后对比 (真实A股)", fontweight="bold", fontsize=14)
+    plt.ylabel("Cumulative Return (%)")
+    plt.legend(loc="upper left")
+    plt.grid(True, alpha=0.3)
+    
+    # 回撤
+    plt.subplot(2, 1, 2)
+    def get_dd(ret):
+        c = np.cumprod(1 + ret)
+        return (c - np.maximum.accumulate(c)) / np.maximum.accumulate(c)
+    
+    plt.plot(res_original["timeline"], get_dd(res_original["strat_returns"]) * 100, color="#d62728", alpha=0.5)
+    plt.plot(res_no_hmm["timeline"], get_dd(res_no_hmm["strat_returns"]) * 100, color="#ff7f0e", alpha=0.5)
+    plt.plot(res_opt["timeline"], get_dd(res_opt["strat_returns"]) * 100, color="#2ca02c", linewidth=2)
+    
+    plt.title("回撤对比 (Drawdown)", fontweight="bold")
+    plt.ylabel("Drawdown (%)")
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig("optimized_hmm_comparison.png", dpi=200)
+    print("\n📊 对比图已保存为: optimized_hmm_comparison.png")
+
+if __name__ == "__main__":
+    main()
