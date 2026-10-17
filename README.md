@@ -62,14 +62,15 @@ No HMM	13.22%	10.95%	1.21	-7.41%	1.78
 No Trend	3.01%	8.27%	0.36	-13.81%	0.22
 Equal Weight (Benchmark)	4.26%	16.95%	0.25	-26.82%	0.16
 
-Key Insights from the Ablation Study
+### Key Insights from the Ablation Study
 
-1. Trend Following is the Core Alpha: Removing the trend filter (No Trend) causes the Sharpe ratio to plummet to 0.36 and doubles the maximum drawdown. This proves that trend following is the cornerstone of drawdown control.
+1. **Trend Following is the Core Alpha**: Removing the trend filter (No Trend) causes the Sharpe ratio to plummet to 0.36 and doubles the maximum drawdown. This proves that trend following is the cornerstone of drawdown control.
+   <img width="3200" height="2000" alt="optimized_hmm_comparison" src="https://github.com/user-attachments/assets/b1db62b6-f1ae-420a-907e-cbdc94193230" />
 
-2. The Trade-off of HMM: Without HMM (No HMM), returns increase significantly<img width="3580" height="2777" alt="real_data_comparison" src="https://github.com/user-attachments/assets/dc1bee90-7baf-482b-bc60-13390425ba76" />
-, but drawdowns expand. The introduction of HMM sacrifices some returns (due to lag) but buys extreme drawdown control (Full Model Max DD is only -6.23%), resulting in an excellent risk-adjusted return.
 
-3. Benchmark Outperformance: During the A-share bear and choppy markets, the Full Model completely crushes the Equal-Weight benchmark in both Sharpe and Max Drawdown.
+2. **The "Sweet Spot" of the Optimized HMM**: As shown in the HMM optimization comparison chart, the standard HMM (Original HMM) suffers from severe lag, sacrificing too much return to control risk. However, our **Optimized HMM (Joint Signal)** achieves an exceptional balance: it captures nearly the same cumulative return as the pure trend-following model (No HMM), while significantly suppressing drawdowns during market downturns. By halving the HMM's defensive signal when the trend is intact, the model avoids being "shaken out" during V-shaped reversals, yet fully trusts the HMM when the trend is broken. This represents a highly mature and practical risk-adjusted improvement.
+
+3. **Benchmark Outperformance**: During the A-share bear and choppy markets, the Full Model completely crushes the Equal-Weight benchmark in both Sharpe and Max Drawdown.
    <img width="3580" height="2777" alt="real_data_comparison" src="https://github.com/user-attachments/assets/3089d49d-6fa2-4643-8033-79e2c51c1124" />
 
 
