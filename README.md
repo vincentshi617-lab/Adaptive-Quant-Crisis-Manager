@@ -77,6 +77,30 @@ Equal Weight (Benchmark)	4.26%	16.95%	0.25	-26.82%	0.16
    <img width="3577" height="2779" alt="ablation_dashboard" src="https://github.com/user-attachments/assets/aed517c4-baa5-4316-b2ad-f57229b937cd" />
 
 
+Results:
+1.Asset Pool Robustness
+   Asset Pool Robustness:Demonstrating the strategy's reliance is not on specific assets. By randomly dropping 2 assets from the pool 30 times, the Sharpe Ratio remains highly concentrated with a mean of 1.27, proving excellent diversification capabilities.
+   
+<img width="2000" height="800" alt="asset_robustness_A-Share" src="https://github.com/user-attachments/assets/4cc78cb8-c365-497e-a4eb-0dccfd042538" />
+
+2. Bootstrap Distribution
+   Monte Carlo Bootstrap Simulation: To test if the performance is just luck, we resampled the historical returns 1,000 times. The 5th percentile of the Sharpe Ratio is still above 0, and the maximum drawdown is strictly concentrated around -5%, indicating statistically significant positive Alpha and robust tail-risk management.
+
+   <img width="2800" height="800" alt="monte_carlo_A-Share" src="https://github.com/user-attachments/assets/10fbc545-40e0-4301-a532-d52e6b7b8278" />
+
+3. 1-Year Rolling Sharpe Ratio
+   1-Year Rolling Sharpe Ratio: Shows the dynamic out-of-sample performance. The rolling Sharpe remains comfortably above the 1.0 target for the vast majority of the time, demonstrating strong and consistent adaptability to changing market conditions.
+
+   <img width="3000" height="800" alt="rolling_sharpe_A-Share" src="https://github.com/user-attachments/assets/335716c9-e6ad-48b3-b737-3c9834e87a95" />
+
+4. Parameter Sensitivity
+   Parameter Sensitivity Heatmap: A robust strategy should not fail if parameters shift slightly. The heatmaps show smooth gradients for both Sharpe Ratio and Max Drawdown, indicating that the optimal thresholds (P_Safe=0.3, P_Risk=0.8) reside on a stable "plateau" rather than a fragile overfitted peak.
+
+   <img width="2800" height="1000" alt="sensitivity_A-Share" src="https://github.com/user-attachments/assets/c74fcba3-1f00-4bb0-828f-8f04ce502ef2" />
+
+
+
+
 Quick Start
 
 Dependencies
