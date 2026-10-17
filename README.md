@@ -33,4 +33,76 @@ This project is not a black box; every module is built upon rigorous mathematica
    Impact: Strips away noise, making the base weight allocation much smoother and more robust.
 
 2. Risk Parity
-3. 
+   Problem: Equal-weighting causes high-volatility assets (like Semiconductors) to dominate the portfolio's risk.
+   Math: Calculates the volatility of each asset via the covariance matrix and allocates weights using 1/σ (inverse volatility). The code uses iterative penalty logic (similar to Lagrange multipliers) to enforce a maximum weight cap (e.g., 20%) per asset, achieving true risk diversification.
+
+3. GARCH Volatility Modeling
+   Problem: Financial asset volatility exhibits "clustering" (large moves are followed by large moves).
+   Math: Generalized Autoregressive Conditional Heteroskedasticity model. Using Maximum Likelihood Estimation (MLE), it utilizes historical residuals and conditional variances to forecast the next week's conditional volatility.
+   Impact: Serves as a critical feature input for the HMM regime detection.
+
+4. Hidden Markov Model (HMM) Crisis Detection
+   Problem: The market alternates between "Bull/Bear/Sideways" regimes. Standard models struggle to capture these hidden states.
+   Math: Based on the Baum-Welch algorithm (EM algorithm), it performs unsupervised clustering on "Return + Volatility" 2D features. Through the transition probability matrix, it outputs the real-time probability of being in a "Crisis" state.
+   Impact: When crisis probability spikes, it directly reduces total exposure, acting as a hard stop-loss.
+
+5. Trend Filter & Joint Signal (Core Innovation)
+   Problem: As a probabilistic model, HMM has inherent lag. In A-share "V-shaped reversals," it often causes the model to cut losses at the bottom and miss the rebound.
+   Math: Calculates the Moving Average over the past N weeks (e.g., 40 weeks). If the closing price breaks below the MA, the asset's weight is discounted.
+   Joint Signal Logic: If the trend is intact, the HMM's warning to reduce exposure is halved (preventing V-shape whipsaws). If the trend is already broken, the system fully trusts the HMM's defensive signal.
+
+Performance & Ablation Study
+Note: The following data is based on real A-share ETF weekly historical data (2021-2024), strictly out-of-sample, with no look-ahead bias.
+
+Performance Comparison (A-Share Market)
+Configuration	Ann. Return	Ann. Vol	Sharpe	Max Drawdown	Calmar
+Full Model	7.91%	7.74%	1.02	-6.23%	1.27
+No RMT	7.67%	7.65%	1.00	-6.23%	1.23
+No HMM	13.22%	10.95%	1.21	-7.41%	1.78
+No Trend	3.01%	8.27%	0.36	-13.81%	0.22
+Equal Weight (Benchmark)	4.26%	16.95%	0.25	-26.82%	0.16
+
+Key Insights from the Ablation Study
+
+1. Trend Following is the Core Alpha: Removing the trend filter (No Trend) causes the Sharpe ratio to plummet to 0.36 and doubles the maximum drawdown. This proves that trend following is the cornerstone of drawdown control.
+
+2. The Trade-off of HMM: Without HMM (No HMM), returns increase significantly<img width="3580" height="2777" alt="real_data_comparison" src="https://github.com/user-attachments/assets/dc1bee90-7baf-482b-bc60-13390425ba76" />
+, but drawdowns expand. The introduction of HMM sacrifices some returns (due to lag) but buys extreme drawdown control (Full Model Max DD is only -6.23%), resulting in an excellent risk-adjusted return.
+
+3. Benchmark Outperformance: During the A-share bear and choppy markets, the Full Model completely crushes the Equal-Weight benchmark in both Sharpe and Max Drawdown.
+   <img width="3580" height="2777" alt="real_data_comparison" src="https://github.com/user-attachments/assets/3089d49d-6fa2-4643-8033-79e2c51c1124" />
+
+
+   <img width="3577" height="2779" alt="ablation_dashboard" src="https://github.com/user-attachments/assets/aed517c4-baa5-4316-b2ad-f57229b937cd" />
+
+
+Quick Start
+
+Dependencies
+pip install -r requirements.txt
+
+Running Code
+# 1. Run the Full Model Backtest (Generates the Dashboard)
+python main.py
+
+# 2. Run the Ablation Study (Generates the module contribution charts)
+python ablation.py
+
+# 3. Run the US Market Long-term Stress Test (2007-2024)
+python run_us_market_test.py
+
+Project Structure & Roadmap
+├── config.py          # Global configuration & module flags
+├── data_utils.py      # Data loading, mock data generator, RMT denoising
+├── risk_models.py     # GARCH volatility & HMM crisis detection
+├── portfolio.py       # Risk parity, trend filter, defensive floor, vol targeting
+├── backtest.py        # Rolling-window backtesting engine
+├── main.py            # Main backtest script
+├── ablation.py        # Ablation study script
+├── stability_tests.py # Stability stress-testing suite
+└── results/           # Exported charts and CSV files
+
+Disclaimer
+
+This project is strictly for academic research and technical exchange in quantitative finance, machine learning, and software engineering. Historical backtest data does not guarantee future returns, and the code does not constitute any investment advice. Markets carry risks; invest with caution.
+
